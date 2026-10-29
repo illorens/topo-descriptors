@@ -11,6 +11,7 @@ requirements = [
     "dask",
     "numpy",
     "pandas",
+    "scikit-image",
     "scipy",
     "utm",
     "xarray",

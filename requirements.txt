@@ -1,7 +1,9 @@
+dask
 netcdf4
 numba
 numpy
 pandas
+scikit-image
 scipy
 utm
 xarray
