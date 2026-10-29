@@ -5,7 +5,8 @@ import numpy.ma as ma
 import xarray as xr
 import dask.array as da
 from numba import njit, prange
-from scipy import ndimage, signal
+from scipy import ndimage, signal, stats
+from skimage.morphology import medial_axis
 
 import topo_descriptors.helpers as hlp
 from topo_descriptors import CFG
@@ -958,3 +959,577 @@ def _sx_name(radius, azimuth):
 
     add = f"_RADIUS{int(radius)}_AZIMUTH{int(azimuth)}"
     return f"SX{add}"
+
+
+def compute_foehn(
+    dem_ds,
+    scale=140e3,
+    sigma_rims=10e3,
+    slope_critical=0.7,
+    slope_spread=0.1,
+    thresh_slope=0.05,
+    thresh_curv=0.00025,
+    ind_nans=[],
+    crop=None,
+    outdir="."
+):
+    """Wrapper to 'foehn' function to launch computations
+    and save outputs as netCDF files.
+
+    Parameters
+    ----------
+    dem_ds : xarray Dataset representing the DEM and its grid coordinates.
+    scale : scalar
+        Scale in meters at which the DEM is smoothed to make the main alpine
+        ridge visible. The standard deviation of the Gaussian kernel is
+        scale / CFG.scale_std. Default is 140 km.
+    sigma_rims : scalar
+        Standard deviation in meters of the Gaussian kernel used to smooth
+        the slope and curvature rims. Default is 10 km.
+    slope_critical : scalar
+        Critical slope (in degrees) for the logistic transformation of the
+        slope. Default is 0.7.
+    slope_spread : scalar
+        Scale parameter (in degrees) of the logistic transformation of the
+        slope. Default is 0.1.
+    thresh_slope : scalar
+        Threshold on the logistic-transformed slope (in [0, 1]) for detecting
+        the slope rim. Default is 0.05.
+    thresh_curv : scalar
+        Threshold on the curvature (gradient magnitude of the
+        logistic-transformed slope) for detecting curvature rims.
+        Default is 0.00025.
+    ind_nans (optional) : tuple of two 1D arrays
+        Contains the (row, column) indices of the NaNs in the original DEM to be
+        reassigned after computations. NaNs in the original DEM should be
+        interpolated prior computations as they propagate in convolutions with
+        the fast Fourier transform method (scipy.signal.convolve).
+    crop (optional) : dict
+        If specified the outputs are cropped to the given extend. Keys should be
+        the coordinates labels of dem_ds and values should be slices of [min,max]
+        extend. Default is None.
+    outdir (optional) : string
+        The path to the output directory. Save to working directory by default.
+
+    See also
+    --------
+    foehn, _create_patches, _extract_patches
+    """
+    hlp.check_dem(dem_ds)
+    logger.info(f"***Starting computation for Foehn descriptors***")
+
+    scale_pxl, res_meters = hlp.meters_to_pixels(scale, dem_ds, rounding="none")
+    sigma = float(scale_pxl) / CFG.scale_std
+    sigma_rims_pxl, _ = hlp.meters_to_pixels(sigma_rims, dem_ds, rounding="none")
+    sigma_rims_pxl = float(sigma_rims_pxl)
+    dem_val = hlp.get_da(dem_ds).values
+
+    arrays = foehn(
+        dem_val,
+        res_meters,
+        sigma,
+        sigma_rims_pxl,
+        slope_critical,
+        slope_spread,
+        thresh_slope,
+        thresh_curv,
+    )
+
+    names = _foehn_names()
+    for name, array in zip(names, arrays):
+        array[ind_nans] = np.nan
+        # descriptors are normalized, hence dimensionless
+        hlp.to_netcdf(array, dem_ds, name, crop, outdir)
+        del array
+
+
+def foehn(
+    dem,
+    res_meters,
+    sigma,
+    sigma_rims,
+    slope_critical=0.7,
+    slope_spread=0.1,
+    thresh_slope=0.05,
+    thresh_curv=0.00025,
+):
+    """Compute South Foehn descriptors over a digital elevation model.
+    The Foehn descriptors capture large- and small-scale variations in
+    the terrain that influence Foehn wind dynamics, helping to identify
+    regions that are more or less susceptible to South Foehn events
+    based on elevation, slope, and curvature patterns.
+
+    Parameters
+    ----------
+    dem : array representing the DEM.
+    res_meters : dict with two 1-D or 2-D arrays
+        Resolution in meters of each DEM grid point in the x and y directions.
+        This is the second element returned by the function
+        hlp.meters_to_pixels.
+    sigma : scalar
+        Standard deviation of the Gaussian filter used to smooth the DEM
+        (in pixel size).
+    sigma_rims : scalar
+        Standard deviation of the Gaussian filter used to smooth the slope and
+        curvature rims (in pixel size).
+    slope_critical : scalar
+        Critical slope (in degrees) for the logistic transformation of the
+        slope. Default is 0.7.
+    slope_spread : scalar
+        Scale parameter (in degrees) controlling the spread of the logistic
+        transformation of the slope. Default is 0.1.
+    thresh_slope : scalar
+        Threshold on the logistic-transformed slope (in [0, 1]) for detecting
+        the slope rim. Default is 0.05.
+    thresh_curv : scalar
+        Threshold on the curvature (gradient magnitude of the
+        logistic-transformed slope) for detecting curvature rims.
+        Default is 0.00025.
+
+    Returns
+    -------
+    list of five arrays :
+        - envelope: Northern alpine slope where South Foehn occurs, weighted
+          by the negative DEM.
+        - cos1 harmonic: represents large-scale elevation variations.
+        - cos2 harmonic: represents finer-scale terrain undulations.
+        - sin1 harmonic: represents large-scale transitions rather than
+          absolute height.
+        - sin2 harmonic: represents finer-scale phase shifts in elevation.
+        Each array is divided by the mean of its non-zero absolute values,
+        hence the outputs are dimensionless.
+
+    See also
+    --------
+    scipy.ndimage.gaussian_filter, scipy.stats.logistic.cdf, _extract_patches,
+    _create_patches, _get_ridge_divide
+
+    Notes
+    -----
+    The steps are as follows:
+
+    1. The DEM is smoothed so that the main alpine ridge becomes visible.
+    2. The slope of the smooth DEM is used to derive the Northern alpine slope.
+    3. The Northern alpine slope region is broadened by including the
+       adjacent band of high curvature to create the envelope.
+    4. The smooth DEM is rescaled to [pi/2, 5*pi/2] and input into
+       trigonometric functions to produce a Fourier decomposition of the
+       smooth DEM. By linearly combining Fourier components, advances
+       and retractions of Foehn into the Swiss plateau can be modelled.
+    5. The Fourier components are multiplied by the Northern alpine slope mask
+       (envelope) to confine them to regions where South Foehn occurs.
+    6. The descriptors are multiplied by the negative high-res DEM
+       (max(DEM) - DEM) to de-emphasize mountaintops and emphasize valley
+       bottoms where Foehn temperature anomalies are strongest.
+
+    The patches are selected by their label from _create_patches, which
+    numbers them in row-major order. The DEM is therefore assumed to have
+    north at the first row (decreasing y) and to cover the Alpine domain,
+    so that the first patch is the Northern alpine slope.
+
+    References
+    ----------
+    This function implements the methodology developed by Louis Frey as
+    part of his PhD thesis at ETHZ. Original implementation in R by
+    Louis Frey (url_to_public_R_code.com).
+
+    If you found this function useful for your own research, consider
+    citing:
+
+    .. code-block:: bibtex
+
+        @article{lastname_papertitle_year,
+          author = {First Name Last Name and Co-author's First Name Last Name},
+          title = {Paper Title},
+          journal = {Journal Name},
+          volume = {Volume Number},
+          number = {Issue Number},
+          pages = {Page Range (e.g., 123--456)},
+          year = {2025},
+          doi = {DOI if available},
+          url = {URL to the paper, if applicable}
+        }
+    """
+    dem_smooth = ndimage.gaussian_filter(dem, sigma, radius=int(3*sigma))
+
+    # Slope rim
+    slope = gradient(dem_smooth, 1, res_meters)[2]
+    slope = stats.logistic.cdf(slope, loc=slope_critical, scale=slope_spread)
+
+    # N/S Alps divide: the flat ridge area (patch 2 of the low-slope patches)
+    slope_divide = _get_ridge_divide(slope, thresh_slope, patch_idx=2)
+
+    slope_thresh = np.where(slope >= thresh_slope, slope, np.nan)
+    slope_thresh[slope_divide] = np.nan
+
+    # Slope rim: first patch, i.e. the northern slope
+    slope_rim = _extract_patches(slope_thresh, patch_idxs=1, val=slope)
+    slope_rim = ndimage.gaussian_filter(
+        slope_rim, sigma_rims, radius=int(3*sigma_rims)
+    )
+
+    # Curvature rims
+    curvature = gradient(slope, 1, res_meters)[2]
+    curvature[:2, :] = 0.  # remove edge artefacts on the northern border
+    curvature_thresh = np.where(curvature >= thresh_curv, curvature, np.nan)
+    curvature_thresh[slope_divide] = np.nan
+
+    # Curvature rim: first patch, i.e. the northern slope
+    curv_rim = _extract_patches(curvature_thresh, patch_idxs=1, val=curvature)
+    curv_rim = ndimage.gaussian_filter(
+        curv_rim, sigma_rims, radius=int(3*sigma_rims)
+    )
+
+    # Envelope: slope rim weighted 3 times more than the curvature rim
+    envelope = (
+        3 * slope_rim / np.nanmax(slope_rim) + curv_rim / np.nanmax(curv_rim)
+    )
+    envelope /= np.nanmax(envelope)
+
+    # Map elevation to phase angles: min_elev -> pi/2, max_elev -> 5*pi/2
+    elevation_range = dem_smooth.max() - dem_smooth.min()
+    elevation_phase_angles = (
+        (dem_smooth - dem_smooth.min()) / elevation_range
+    ) * (2 * np.pi) + (np.pi / 2)
+
+    # Harmonics
+    foehn_fields = [
+        1,
+        np.cos(elevation_phase_angles),
+        np.cos(2 * elevation_phase_angles),
+        np.sin(elevation_phase_angles),
+        np.sin(2 * elevation_phase_angles),
+    ]
+
+    # Final fields: harmonic * envelope * terrain_neg, normalized by the mean
+    # of the non-zero absolute values
+    terrain_neg = np.nanmax(dem) - dem
+    for i, field in enumerate(foehn_fields):
+        field = field * envelope * terrain_neg
+
+        mean_abs = np.nanmean(np.abs(field[field != 0]))
+        foehn_fields[i] = field / mean_abs
+
+    return foehn_fields
+
+
+def _create_patches(dem, neighbors: int = 8, fillna_value: float = 0):
+    """Identify and label contiguous patches in a 2D array.
+
+    Parameters
+    ----------
+    dem : array-like
+        Array to be labeled. Any non-zero values are counted as features
+        and zero values are considered the background.
+    neighbors : int
+        Connectivity for determining adjacent elements. Must be either 4 or 8.
+        4 - considers only orthogonal neighbors (up, down, left, right).
+        8 - includes diagonal neighbors as well.
+        Default is 8.
+    fillna_value : scalar
+        Value to replace NaNs with in preprocessing. Default is 0 (background).
+
+    Returns
+    -------
+    int32 array with a label for each patch, numbered from 1 in row-major
+    order. The background is 0.
+
+    See also
+    --------
+    scipy.ndimage.label
+    """
+    if neighbors == 4:
+        struct = [[0, 1, 0],
+                  [1, 1, 1],
+                  [0, 1, 0]]
+    elif neighbors == 8:
+        struct = [[1, 1, 1],
+                  [1, 1, 1],
+                  [1, 1, 1]]
+    else:
+        raise ValueError("`neighbors` must be either 4 or 8")
+
+    values = np.nan_to_num(dem, nan=fillna_value)
+    labeled_array, _ = ndimage.label(values, structure=struct) # type: ignore
+
+    return labeled_array
+
+
+def _extract_patches(dem_thresh, patch_idxs, val=1.):
+    """Extract specific patches from a DEM based on thresholded data.
+
+    Parameters
+    ----------
+    dem_thresh : array-like
+        A binary or thresholded version of the DEM where non-zero values
+        indicate areas of interest. NaNs are considered background.
+    patch_idxs : int or array-like
+        The patch indices to extract from the labeled array. These
+        correspond to the unique int identifiers assigned by
+        _create_patches().
+    val : array-like or float
+        Value used to fill the selected patches. Either an array with the
+        same shape as dem_thresh or a float. Default is 1.
+
+    Returns
+    -------
+    np.ndarray or tuple of np.ndarray where the selected patch is filled with
+    val and all other elements are 0.
+        If patch_idxs is an int or contains a single index, returns an array.
+        If patch_idxs contains multiple indices, returns a tuple of arrays.
+
+    See also
+    --------
+    _create_patches
+    """
+    if not hasattr(patch_idxs, "__iter__"):
+        patch_idxs = [patch_idxs]
+
+    patches = _create_patches(dem_thresh)
+
+    dem_patches = [np.where(patches == idx, val, 0) for idx in patch_idxs]
+
+    return tuple(dem_patches) if len(patch_idxs) != 1 else dem_patches[0]
+
+
+def _get_ridge_divide(dem, thresh, patch_idx):
+    """Compute a thin line along a mountain ridge that separates its two sides
+    (e.g. the N/S Alps divide).
+
+    The flat area of the ridge is selected as the patch of values below
+    thresh, reduced to its skeleton (medial axis) and extrapolated with a
+    polynomial fit to the closest domain edges.
+
+    Parameters
+    ----------
+    dem : array-like
+        Field in which the ridge is flat, e.g. the logistic-transformed slope.
+    thresh : float
+        Values below thresh are considered part of the flat ridge area.
+    patch_idx : int
+        Index of the patch, as labeled by _create_patches, that corresponds
+        to the ridge area.
+
+    Returns
+    -------
+    Boolean array, True along the ridge divide (dilated by 3 pixels).
+
+    See also
+    --------
+    _extract_patches, skimage.morphology.medial_axis,
+    numpy.polynomial.polynomial.Polynomial.fit, scipy.ndimage.binary_dilation
+    """
+
+    height, width = dem.shape
+
+    dem_bin = dem < thresh
+    ridge_patch = _extract_patches(dem_bin, patch_idxs=patch_idx)
+    # smooth the patch outline to avoid spurious branches in the skeleton
+    ridge_patch = ndimage.gaussian_filter(ridge_patch, 9) > 0.2
+
+    skeleton = medial_axis(ridge_patch)
+    # TODO: np.where returns the pixels in row-major order, not ordered along
+    # the skeleton, so the first/last points are not necessarily its endpoints
+    y_idx, x_idx = np.where(skeleton)
+
+    def extrapolate_to_closest_edge(x_idx, y_idx, width, height, before, n_fit=20, deg=2, offset=5):
+        edge_idx = 0 if before else -1
+        x_edge, y_edge = x_idx[edge_idx], y_idx[edge_idx]
+        dist = min(
+            abs(x_edge + 1 - width), x_edge, abs(y_edge + 1 - height), y_edge
+        )
+        if dist == 0:
+            return [], []
+
+        if before:
+            idxs = slice(0, n_fit)
+            u_extrap = np.linspace(-(dist + offset), -1, 2*dist)
+        else:
+            idxs = slice(-n_fit, None)
+            u_extrap = np.linspace(len(x_idx), len(x_idx) + (dist + offset), 2*dist)
+
+        u_fit = np.arange(n_fit)
+        px = np.polynomial.polynomial.Polynomial.fit(u_fit, x_idx[idxs], deg=deg)
+        py = np.polynomial.polynomial.Polynomial.fit(u_fit, y_idx[idxs], deg=deg)
+
+        return px(u_extrap), py(u_extrap)
+
+    x_before, y_before = extrapolate_to_closest_edge(x_idx, y_idx, width, height, before=True)
+    x_after, y_after = extrapolate_to_closest_edge(x_idx, y_idx, width, height, before=False)
+
+    # Combine extrapolated + original
+    x_full = np.round(np.concatenate((x_before, x_idx, x_after))).astype(int)
+    y_full = np.round(np.concatenate((y_before, y_idx, y_after))).astype(int)
+    valid_mask = (
+        (x_full >= 0) & (x_full < width) & (y_full >= 0) & (y_full < height)
+    )
+    x_smooth_idx = x_full[valid_mask]
+    y_smooth_idx = y_full[valid_mask]
+
+    ridge_divide = np.zeros_like(dem, dtype=bool)
+    ridge_divide[y_smooth_idx, x_smooth_idx] = True
+    ridge_divide = ndimage.binary_dilation(ridge_divide, iterations=3)
+
+    return ridge_divide
+
+
+def _foehn_names():
+    """Return names for the arrays in output of the foehn function"""
+    name_envelope = "FOEHN_ENVELOPE"
+    name_cos1 = "FOEHN_COS1"
+    name_cos2 = "FOEHN_COS2"
+    name_sin1 = "FOEHN_SIN1"
+    name_sin2 = "FOEHN_SIN2"
+
+    return [name_envelope, name_cos1, name_cos2, name_sin1, name_sin2]
+
+
+def compute_valley_effect(
+    dem_ds,
+    scales=59e3,
+    valley_ref_elevation=1300,
+    elevation_spread=170,
+    depth_emphasis=1.75,
+    ind_nans=[],
+    crop=None,
+    outdir="."
+):
+    """Wrapper to 'valley_effect' function to launch computations
+    and save outputs as netCDF files.
+
+    Parameters
+    ----------
+    dem_ds : xarray Dataset representing the DEM and its grid coordinates.
+    scales : scalar or list of scalars
+        Scale(s) in meters on which we want to compute the valley effect.
+        Corresponds to the diameter of the kernel used to compute it.
+    valley_ref_elevation : scalar
+        Reference elevation for the logistic transformation (in meters).
+        Default is 1300.
+    elevation_spread : scalar
+        Scale parameter controlling the spread of the logistic transformation
+        (in meters). Default is 170.
+    depth_emphasis : scalar
+        Exponent applied to the elevation difference to emphasize deeper
+        valleys. Default is 1.75.
+    ind_nans (optional) : tuple of two 1D arrays
+        Contains the (row, column) indices of the NaNs in the original DEM to be
+        reassigned after computations. NaNs in the original DEM should be
+        interpolated prior computations as they propagate in convolutions with
+        the fast Fourier transform method (scipy.signal.convolve).
+    crop (optional) : dict
+        If specified the outputs are cropped to the given extend. Keys should be
+        the coordinates labels of dem_ds and values should be slices of [min,max]
+        extend. Default is None.
+    outdir (optional) : string
+        The path to the output directory. Save to working directory by default.
+
+    See also
+    --------
+    valley_effect
+    """
+    hlp.check_dem(dem_ds)
+    logger.info(f"***Starting valley effect computation for scales {scales} meters***")
+    if not hasattr(scales, "__iter__"):
+        scales = [scales]
+
+    scales_pxl, _ = hlp.scale_to_pixel(scales, dem_ds)
+    dem_val = hlp.get_da(dem_ds).values
+
+    for idx, scale_pxl in enumerate(scales_pxl):
+        logger.info(f"Computing scale {scales[idx]} meters ...")
+        name = _valley_effect_name(scales[idx])
+        array = valley_effect(
+            dem_val,
+            scale_pxl,
+            valley_ref_elevation,
+            elevation_spread,
+            depth_emphasis
+        )
+        array[ind_nans] = np.nan
+        # descriptor is normalized, hence dimensionless
+        hlp.to_netcdf(array, dem_ds, name, crop, outdir)
+        del array
+
+
+def valley_effect(
+    dem,
+    size,
+    valley_ref_elevation=1300,
+    elevation_spread=170,
+    depth_emphasis=1.75,
+):
+    """Compute a descriptor for the valley effect in alpine terrain.
+    Identifies valleys by comparing a logistically transformed smoothed
+    DEM with the original DEM, emphasizing deeper areas.
+
+    Parameters
+    ----------
+    dem : array representing the DEM.
+    size : int
+        Size of the kernel for the convolution. Represents the diameter
+        (i.e. scale) at which the DEM is smoothed (in pixel size).
+    valley_ref_elevation : scalar
+        Reference elevation for the logistic transformation (in meters).
+        Default is 1300.
+    elevation_spread : scalar
+        Scale parameter controlling the spread of the logistic transformation
+        (in meters). Default is 170.
+    depth_emphasis : scalar
+        Exponent applied to the elevation difference to emphasize deeper
+        valleys. Default is 1.75.
+
+    Returns
+    -------
+    array with valley effect values, divided by the mean of the non-zero
+    values (dimensionless).
+
+    See also
+    --------
+    scipy.signal.convolve, scipy.stats.logistic.cdf, circular_kernel
+
+    References
+    ----------
+    This function implements the methodology developed by Louis Frey as
+    part of his PhD thesis at ETHZ. Original implementation in R by
+    Louis Frey (url_to_public_R_code.com).
+
+    If you found this function useful for your own research, consider
+    citing:
+
+    .. code-block:: bibtex
+
+        @article{lastname_papertitle_year,
+          author = {First Name Last Name and Co-author's First Name Last Name},
+          title = {Paper Title},
+          journal = {Journal Name},
+          volume = {Volume Number},
+          number = {Issue Number},
+          pages = {Page Range (e.g., 123--456)},
+          year = {2025},
+          doi = {DOI if available},
+          url = {URL to the paper, if applicable}
+        }
+    """
+    kernel = circular_kernel(size)
+    kernel = kernel / kernel.sum()
+    padded_dem = np.pad(dem, kernel.shape[0] // 2, mode="edge")
+    dem_smooth = signal.convolve(padded_dem, kernel, mode="valid")
+
+    dem_transf = stats.logistic.cdf(
+        dem_smooth, loc=valley_ref_elevation, scale=elevation_spread
+    )
+
+    # Match original DEM range
+    min_dem, max_dem = np.nanmin(dem), np.nanmax(dem)
+    dem_transf = dem_transf * (max_dem - min_dem) + min_dem
+
+    valley_pred = np.maximum(dem_transf - dem, 0.) ** depth_emphasis
+    cond_mean = np.nanmean(valley_pred[valley_pred != 0])
+
+    return valley_pred / cond_mean
+
+
+def _valley_effect_name(scale):
+    """Return name for the array in output of the valley_effect function"""
+    return f"VALLEY_EFFECT_{int(scale)}M"
