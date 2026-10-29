@@ -85,6 +85,67 @@ def scale_to_pixel(scales, dem_ds):
     dict with two 1-D or 2-D arrays :
         Resolution in meters of each DEM grid points in the x and y directions.
     """
+    return meters_to_pixels(scales, dem_ds, rounding='up_to_odd_int')
+
+
+def meters_to_pixels(dist_meters, dem_ds, rounding='up_to_odd_int'):
+    """Convert distances in meters to pixels based on the DEM resolution.
+
+    Parameters
+    ----------
+    dist_meters : scalar or list of scalars
+        Distance(s) in meters.
+    dem_ds : xarray Dataset representing the DEM and its grid coordinates.
+        Coordinates must be projected or in WGS84 and named 'x', 'y'.
+        In the latter case, they are reprojected to UTM to derive the
+        average resolution in meters.
+    rounding : {'up_to_odd_int', 'closest_int', 'none'}
+        'up_to_odd_int':
+            The resulting distances in pixels are rounded to the nearest odd
+            integer (see round_up_to_odd). Default.
+        'closest_int':
+            The resulting distances in pixels are rounded to the closest integer.
+        'none':
+            The resulting distances are returned not rounded.
+
+    Returns
+    -------
+    dist_pixels : scalar or array
+        Contains the corresponding distances in pixels.
+    res_meters : dict with two 1-D or 2-D arrays
+        Resolution in meters of each DEM grid point in the x and y directions.
+    """
+    rounding_options = {'up_to_odd_int', 'closest_int', 'none'}
+    if rounding not in rounding_options:
+        raise ValueError(f"rounding must be one of {rounding_options}.")
+
+    res_meters, mean_res = get_dem_resolution(dem_ds)
+    dist_pixels = np.array(dist_meters) / mean_res
+
+    if rounding == "up_to_odd_int":
+        return round_up_to_odd(dist_pixels), res_meters
+    if rounding == "closest_int":
+        return np.round(dist_pixels).astype(int), res_meters
+    return dist_pixels, res_meters
+
+
+def get_dem_resolution(dem_ds):
+    """Get resolution in meters of DEM.
+
+    Parameters
+    ----------
+    dem_ds : xarray Dataset representing the DEM and its grid coordinates.
+        Coordinates must be projected or in WGS84 and named 'x', 'y'.
+        In the latter case, they are reprojected to UTM to derive the
+        average resolution in meters.
+
+    Returns
+    -------
+    res_meters : dict with two 1-D or 2-D arrays
+        Resolution in meters of each DEM grid point in the x and y directions.
+    mean_res : scalar
+        Average resolution in meters.
+    """
     check_dem(dem_ds)
     x_coords, y_coords = dem_ds["x"].values, dem_ds["y"].values
     epsg_code = dem_ds.attrs["crs"].lower()
@@ -102,7 +163,7 @@ def scale_to_pixel(scales, dem_ds):
     mean_res = np.mean(np.abs([x_res.mean(), y_res.mean()]))
     logger.debug(f"Estimated resolution: {mean_res:.0f} meters.")
 
-    return round_up_to_odd(np.array(scales) / mean_res), {"x": x_res, "y": y_res}
+    return {"x": x_res, "y": y_res}, mean_res
 
 
 def round_up_to_odd(f):
